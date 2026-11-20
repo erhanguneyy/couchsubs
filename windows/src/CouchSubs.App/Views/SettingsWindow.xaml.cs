@@ -79,6 +79,7 @@ public partial class SettingsWindow : Window
         // Num 8: oyunun o anki görüntüsü önizlemeye alınır.
         controller.SnapshotRequested += OnSnapshot;
         Closed += (_, _) => controller.SnapshotRequested -= OnSnapshot;
+        DesktopStyle.Attach(controller);
         Dubbing.Attach(controller);
         FirewallSettings.Attach(controller);
         OutputCard.Attach(controller);

@@ -28,9 +28,6 @@ namespace CouchSubs.App.Views;
 public sealed partial class SubtitleOverlayWindow : Window
 {
     private const int GwlExStyle = -20;
-    private const long WsExTransparent = 0x20;
-    private const long WsExToolWindow = 0x80;
-    private const long WsExNoActivate = 0x08000000;
 
     [LibraryImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     private static partial IntPtr GetWindowLongPtr(IntPtr window, int index);
@@ -47,6 +44,12 @@ public sealed partial class SubtitleOverlayWindow : Window
     /// <summary>Görünen satırların kutuları; solan satırın animasyonu yeniden çizimde baştan başlamasın.</summary>
     private readonly Dictionary<int, Border> boxes = [];
     private readonly Grid adjustLayer = new() { Visibility = Visibility.Collapsed };
+    /// <summary>Pencerenin içeriği; bulanık arka plan bunun boyutuna göre boyanır.</summary>
+    private readonly Grid root = new();
+    /// <summary>Kaybolan satırlar solarken burada, son yerlerinde durur (satırlar kayınca yerleri değişmez).</summary>
+    private readonly Canvas exitLayer = new() { IsHitTestVisible = false };
+    /// <summary>Son çizimde görünen satırlar; yalnız yeni gelen satır belirme animasyonuyla girer.</summary>
+    private HashSet<int> shownIds = [];
     /// <summary>Başka bir tam ekran ya da üstte duran pencere öne gelince altyazıyı yeniden en üste koyar.</summary>
     private readonly TopmostKeeper topmost;
     private IntPtr handle;
@@ -74,11 +77,11 @@ public sealed partial class SubtitleOverlayWindow : Window
         Title = "CouchSubs";
         topmost = new TopmostKeeper(this);
 
-        var root = new Grid();
         regionsPanel = new DesktopRegionsPanel(linesPanel, 8 * Scale);
         root.Children.Add(adjustLayer);
         root.Children.Add(new Border { Padding = new Thickness(24 * Scale, 0, 24 * Scale, 8 * Scale), Child = linesPanel });
         root.Children.Add(new Border { Padding = new Thickness(24 * Scale, 8 * Scale, 24 * Scale, 0), Child = regionsPanel });
+        root.Children.Add(exitLayer);
         BuildAdjustLayer();
         Content = root;
         PlaceFromSettings();
@@ -93,8 +96,7 @@ public sealed partial class SubtitleOverlayWindow : Window
             handle = new WindowInteropHelper(this).Handle;
             if (handle == IntPtr.Zero) return;
             var style = (long)GetWindowLongPtr(handle, GwlExStyle);
-            // Odağı almaz ve Alt+Tab listesinde görünmez.
-            SetWindowLongPtr(handle, GwlExStyle, (IntPtr)(style | WsExNoActivate | WsExToolWindow));
+            SetWindowLongPtr(handle, GwlExStyle, (IntPtr)OverlayWindowStyle.Base(style));
             ApplyClickThrough();
         });
         // Tıklamalar geçmiyorsa pencere her yerinden sürüklenir.
@@ -104,6 +106,12 @@ public sealed partial class SubtitleOverlayWindow : Window
             try { DragMove(); }
             catch (InvalidOperationException) { return; /* düğme bu arada bırakıldı */ }
             SaveBounds();
+        });
+        // Başka DPI'lı ekrana taşındı: bulanıklığın kırpma bölgesi yeni piksel ölçeğiyle yeniden kurulur.
+        DpiChanged += (_, _) => Guard("DPI", () =>
+        {
+            blurRegion = null;
+            ApplyBlur(IsVisible);
         });
         controller.OverlayEvent += OnEvent;
         controller.OverlayHidden += OnHidden;
@@ -117,6 +125,7 @@ public sealed partial class SubtitleOverlayWindow : Window
         controller.PropertyChanged -= OnChanged;
         timer.Stop();
         topmost.Dispose();
+        StopBackdrop();
         try { Close(); }
         catch (InvalidOperationException error) { StartupGuard.Log("Altyazı penceresi kapatılamadı", error); }
     }
@@ -126,8 +135,9 @@ public sealed partial class SubtitleOverlayWindow : Window
         if (e.PropertyName is not (nameof(AppController.Settings) or nameof(AppController.OverlayAdjusting))) return;
         Guard("ayar değişikliği", () =>
         {
-            // Yazı boyu, rengi ya da zemini değişmiş olabilir; kutular yeniden kurulur.
-            if (e.PropertyName == nameof(AppController.Settings)) boxes.Clear();
+            // Görünüm değiştiyse kutular yeniden kurulur; başka bir ayar değişince (ör. çeviri motoru) görünen satırlar
+            // olduğu gibi kalır, solan satırın animasyonu baştan başlamaz.
+            if (e.PropertyName == nameof(AppController.Settings) && LookChanged()) boxes.Clear();
             ApplyClickThrough();
             FitHeight();
             Refresh();
@@ -224,14 +234,23 @@ public sealed partial class SubtitleOverlayWindow : Window
             lines.Add(new SubtitleStack.Line(0, Localizer.Current["Subtitles appear here."], SubtitleStack.Role.Current, false, false));
         adjustLayer.Visibility = adjusting ? Visibility.Visible : Visibility.Collapsed;
 
+        var look = Resolved;
+        var animate = look.Animation != DesktopAnimation.None && look.AnimationDuration > 0;
+        var removed = boxes.Keys.Except(lines.Select(l => l.Id)).ToList();
+        // Kaybolan satır: animasyon açıksa son yerinde solarak çıkar (pencere görünürken).
+        var leaving = animate && IsVisible && controller.ShowsOnComputer
+            ? removed.Select(id => boxes[id]).Where(box => box.Parent == linesPanel && box.IsVisible).Select(box => (Box: box, At: box.TranslatePoint(default, root))).ToList()
+            : [];
         linesPanel.Children.Clear();
-        foreach (var id in boxes.Keys.Except(lines.Select(l => l.Id)).ToList()) boxes.Remove(id);
+        foreach (var id in removed) boxes.Remove(id);
+        foreach (var (box, at) in leaving) Leave(box, at, look);
         foreach (var line in lines)
         {
             if (!boxes.TryGetValue(line.Id, out var box))
             {
                 box = MakeBox(line);
                 boxes[line.Id] = box;
+                if (animate && !shownIds.Contains(line.Id)) BoxAnimation.Enter(box, look, Scale);
             }
             if (line.Fading && box.Tag is not "fading")
             {
@@ -241,13 +260,15 @@ public sealed partial class SubtitleOverlayWindow : Window
             linesPanel.Children.Add(box);
         }
 
+        shownIds = [.. lines.Select(line => line.Id)];
         regionsPanel.ShowRegions(regions, MakeRegionBox);
 
-        var visible = controller.ShowsOnComputer && (lines.Count > 0 || regions.Count > 0);
+        var visible = controller.ShowsOnComputer && (lines.Count > 0 || regions.Count > 0 || exitLayer.Children.Count > 0);
         if (visible && !IsVisible) Show();
         else if (!visible && IsVisible) Hide();
         // Arada öne gelen tam ekran/üstte duran pencere altyazıyı örtmüş olabilir; odak alınmadan yeniden üste konur.
         if (visible) topmost.RaiseThrottled();
+        ApplyBlur(visible);
 
         timer.Stop();
         if (stack.NextChange(now) is { } next)
@@ -257,55 +278,64 @@ public sealed partial class SubtitleOverlayWindow : Window
         }
     }
 
-    /// <summary>TV'deki altyazı kutusunun aynısı: siyah yarı saydam zemin, beyaz ya da sarı yarı kalın yazı, üst satırlar soluk.</summary>
+    /// <summary>Çizilen görünüm (dondurulmuş fırça, kalem, gölge); görünüm ya da ölçek değişmedikçe aynı kalır.</summary>
+    private DesktopLook? look;
+    /// <summary>Kutuların kurulduğu ayarlar; bunlar değişmedikçe kutular yeniden kurulmaz.</summary>
+    private (DesktopSubtitleStyle Look, SubtitleStyle Tv, bool SpeakerColors)? drawn;
+
+    /// <summary>Penceredeki görünüm: Ayarlar'daki "Bilgisayar ekranında" (TV'yi izliyorsa TV görünümü).</summary>
+    private DesktopSubtitleStyle Resolved => DesktopStyles.Resolve(controller.Settings.DesktopStyle, controller.Settings.Style);
+
+    private DesktopLook Look => look = DesktopLook.For(Resolved, Scale, look);
+
+    private bool LookChanged()
+    {
+        var settings = controller.Settings;
+        var now = (Resolved, settings.Style, settings.SpeakerColors);
+        if (drawn == now) return false;
+        drawn = now;
+        return true;
+    }
+
+    /// <summary>
+    /// Altyazı kutusu (bkz. <see cref="DesktopSubtitleBox"/>): seçili görünümde; TV'yi izliyorsa TV'deki kutunun aynısı
+    /// (siyah yarı saydam zemin, beyaz ya da sarı yarı kalın yazı). Üst satırlar soluk.
+    /// </summary>
     private Border MakeBox(SubtitleStack.Line line)
     {
-        var style = controller.Settings.Style;
-        var scale = Scale;
+        var settings = controller.Settings;
         var current = line.Role == SubtitleStack.Role.Current;
-        // Satır yüksekliği sıfır olursa WPF hata verir; boy en az 1.
         // Uzun çeviri en çok 3 satıra dengeli bölünür; 3 satıra sığmazsa yazı biraz küçülür (bkz. SubtitleWrap).
         var wrapped = line.Wrapped;
-        var size = Math.Max(1, OverlayPlacement.FontSize(style.FontSize) * scale * (current ? 1 : 0.8) * wrapped.Scale);
-        var alpha = Math.Clamp(style.Background, 0, 100) / 100.0 * (current ? 1 : 0.83);
-        // Bant: kutu pencerenin tüm genişliğini kaplar, oyundaki İngilizce yazıyı yan yana da gizler.
-        var band = style.BackgroundShape == SubtitleBackgroundShape.Band;
-        var text = new TextBlock
-        {
-            FontSize = size,
-            FontWeight = style.Bold ? FontWeights.Bold : FontWeights.SemiBold,
-            Foreground = style.TextColor == SubtitleTextColor.Yellow ? new SolidColorBrush(Color.FromRgb(0xFF, 0xE1, 0x35)) : Brushes.White,
-            TextWrapping = TextWrapping.Wrap,
-            TextAlignment = line.Paragraphs ? TextAlignment.Left : TextAlignment.Center,
-            LineHeight = size * 1.3,
-            Effect = new DropShadowEffect { Color = Colors.Black, ShadowDepth = 2 * scale, BlurRadius = 4 * scale, Opacity = 1, Direction = 270 },
-        };
-        // Konuşana göre renk: "Ad: …" satırı o konuşanın renginde (ayar kapalıysa düz metin).
-        SpeakerText.Fill(text, wrapped.Text, line.Text, controller.Settings.SpeakerColors, controller.SpeakerBook);
-        return new Border
-        {
-            Background = new SolidColorBrush(Color.FromArgb((byte)Math.Round(alpha * 255), 0, 0, 0)),
-            CornerRadius = new CornerRadius(band ? 0 : 10 * scale),
-            Padding = current ? new Thickness(26 * scale, 10 * scale, 26 * scale, 10 * scale) : new Thickness(20 * scale, 6 * scale, 20 * scale, 6 * scale),
-            Margin = new Thickness(band ? -24 * scale : 0, 14 * scale, band ? -24 * scale : 0, 0),
-            HorizontalAlignment = band ? HorizontalAlignment.Stretch : HorizontalAlignment.Center,
-            Opacity = line.Role switch { SubtitleStack.Role.Current => 1, SubtitleStack.Role.Previous => 0.6, _ => 0.45 },
-            Child = text,
-        };
+        var box = DesktopSubtitleBox.Make(Look, wrapped.Text, line.Text, current, line.Paragraphs, wrapped.Scale,
+            band: settings.Style.BackgroundShape == SubtitleBackgroundShape.Band, settings.SpeakerColors, controller.SpeakerBook);
+        box.Opacity = line.Role switch { SubtitleStack.Role.Current => 1, SubtitleStack.Role.Previous => 0.6, _ => 0.45 };
+        return box;
     }
 
     /// <summary>Ek alanın çevirisi: altyazıdan küçük, koyu zeminli kutu; oyundaki yazının bulunduğu yana yaslı.</summary>
     private Border MakeRegionBox(string text, CouchSubs.Core.TextBox? area, IReadOnlyList<ScreenTranslation.Item>? blocks)
     {
-        var style = controller.Settings.Style;
+        var look = Look;
         var scale = Scale;
-        var size = Math.Max(12, OverlayPlacement.FontSize(style.FontSize) * scale * 0.55);
+        var size = Math.Max(12, look.Style.FontSize * scale * 0.55);
         // Otomatik bulunan ekran yazısı: çeviri özgün yazının stilinde.
         var apart = controller.Settings.SetTextApart;
         if (apart && StyledRegionBox.Make(blocks, size, scale, translucent: true) is { } styled) return styled;
         // Ayrık gösterim: stili bilinmeyen ek alan kutusu altyazı kutusuna benzemesin, zeminsiz ve koyu gölgeli.
         if (apart && StyledRegionBox.Plain(text, size, scale, area) is { } plain) return plain;
         var middle = area is { } box ? (box.Left + box.Right) / 2 : 0.5;
+        // Yazı tipi ve rengi altyazınınki gibi; okunur kalsın diye zemin her zaman koyu.
+        var label = new TextBlock
+        {
+            Text = text,
+            FontSize = size,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = look.Text,
+            TextWrapping = TextWrapping.Wrap,
+            LineHeight = size * 1.25,
+        };
+        if (look.Family is { } family) label.FontFamily = family;
         return new Border
         {
             Background = new SolidColorBrush(Color.FromArgb(0xD9, 0, 0, 0)),
@@ -313,15 +343,7 @@ public sealed partial class SubtitleOverlayWindow : Window
             Padding = new Thickness(14 * scale, 6 * scale, 14 * scale, 6 * scale),
             Margin = new Thickness(0, 0, 0, 10 * scale),
             HorizontalAlignment = middle < 0.4 ? HorizontalAlignment.Left : middle > 0.6 ? HorizontalAlignment.Right : HorizontalAlignment.Center,
-            Child = new TextBlock
-            {
-                Text = text,
-                FontSize = size,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = style.TextColor == SubtitleTextColor.Yellow ? new SolidColorBrush(Color.FromRgb(0xFF, 0xE1, 0x35)) : Brushes.White,
-                TextWrapping = TextWrapping.Wrap,
-                LineHeight = size * 1.25,
-            },
+            Child = label,
         };
     }
 
@@ -385,20 +407,136 @@ public sealed partial class SubtitleOverlayWindow : Window
         return thumb;
     }
 
+    /// <summary>Kaybolan satırı son yerinde soldurur, bitince kaldırır (pencere boşaldıysa gizlenir).</summary>
+    private void Leave(Border box, Point at, DesktopSubtitleStyle look)
+    {
+        var size = box.RenderSize;
+        box.Margin = new Thickness(0);
+        box.HorizontalAlignment = HorizontalAlignment.Left;
+        box.Width = size.Width;
+        box.Height = size.Height;
+        Canvas.SetLeft(box, at.X);
+        Canvas.SetTop(box, at.Y);
+        exitLayer.Children.Add(box);
+        BoxAnimation.Exit(box, look, () => Guard("kaybolma", () =>
+        {
+            exitLayer.Children.Remove(box);
+            Refresh();
+        }));
+    }
+
+    /// <summary>Ekrandan yakalanan, şiddeti ayarlanabilir bulanıklık; açık değilse ya da desteklenmiyorsa null.</summary>
+    private ScreenBackdrop? backdrop;
+    /// <summary>Pencere ekran yakalamasından hariç tutulamadı: bu oturumda Windows'un sabit bulanıklığı kullanılır.</summary>
+    private bool captureUnavailable;
+
+    /// <summary>
+    /// Arka plan bulanıklığı. Önce ekrandan yakalanan, şiddeti ayarlanabilir bulanıklık (<see cref="ScreenBackdrop"/>):
+    /// pencere görünürken çalışır, gizliyken durur. Windows pencereyi yakalamadan hariç tutamıyorsa Windows'un sabit
+    /// bulanıklığına düşülür (<see cref="ApplySystemBlur"/>). Kapalıyken pencereye dokunulmaz.
+    /// </summary>
+    private void ApplyBlur(bool visible)
+    {
+        if (handle == IntPtr.Zero) return;
+        var look = Resolved;
+        if (!look.BackgroundBlur) StopBackdrop();
+        else if (!captureUnavailable)
+        {
+            if (backdrop is null && visible)
+            {
+                backdrop = ScreenBackdrop.TryStart(handle, Dispatcher, frame => Guard("bulanıklık", () => BackdropPainter.Paint(root, frame)));
+                captureUnavailable = backdrop is null;
+                if (captureUnavailable) StartupGuard.Log("Arka plan bulanıklığı: pencere ekran yakalamasından hariç tutulamadı; Windows bulanıklığı kullanılıyor", null);
+            }
+            if (backdrop is not null)
+            {
+                ApplySystemBlur(false, visible);
+                var device = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice.M11 ?? 1;
+                backdrop.RadiusPixels = look.BlurRadius * Scale * device;
+                backdrop.Running = visible;
+                if (visible)
+                {
+                    // Yeni kutu bir sonraki kareyi beklemeden son bulanık görüntüyle dolsun.
+                    UpdateLayout();
+                    BackdropPainter.Paint(root, backdrop.Current);
+                }
+                return;
+            }
+        }
+        ApplySystemBlur(look.BackgroundBlur, visible);
+    }
+
+    private void StopBackdrop()
+    {
+        backdrop?.Dispose();
+        backdrop = null;
+    }
+
+    /// <summary>Kutunun köşe yarıçapı (katmanlı kutuda iç çerçevenin).</summary>
+    private static double CornerOf(FrameworkElement element) => element switch
+    {
+        Border box when DesktopSubtitleBox.Split(box) is { } parts => parts.Frame.CornerRadius.TopLeft,
+        Border border => border.CornerRadius.TopLeft,
+        _ => 0,
+    };
+
+    /// <summary>Bulanıklık açık mı (pencereye en son uygulanan).</summary>
+    private bool blurOn;
+    /// <summary>Pencereye en son uygulanan kırpma bölgesi; aynıysa yeniden kurulmaz. null: kırpma yok.</summary>
+    private IReadOnlyList<PixelBox>? blurRegion;
+
+    /// <summary>
+    /// Yedek: Windows'un sabit bulanıklığı (pencerenin yeri ayarlanmıyorsa); pencere yalnız görünen kutuların şekline
+    /// kırpılır. Kapalıyken pencereye dokunulmaz.
+    /// </summary>
+    private void ApplySystemBlur(bool blur, bool visible)
+    {
+        var wanted = blur && !controller.OverlayAdjusting;
+        if (wanted != blurOn)
+        {
+            WindowBlur.SetEnabled(handle, wanted);
+            blurOn = wanted;
+        }
+        if (!wanted || !visible)
+        {
+            if (!wanted && blurRegion is not null)
+            {
+                WindowBlur.SetRegion(handle, null);
+                blurRegion = null;
+            }
+            return;
+        }
+        // Yeni kutuların yeri ancak yerleşimden sonra bilinir; bölge çizimden önce hazır olsun diye şimdi yerleştirilir.
+        UpdateLayout();
+        var device = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice ?? Matrix.Identity;
+        var shown = linesPanel.Children.OfType<FrameworkElement>().Concat(exitLayer.Children.OfType<FrameworkElement>()).Concat(regionsPanel.Boxes)
+            .Where(element => element.IsVisible && element.ActualWidth > 0 && element.ActualHeight > 0)
+            .Select(element =>
+            {
+                var bounds = element.TransformToAncestor(this).TransformBounds(new Rect(element.RenderSize));
+                var radius = CornerOf(element);
+                return (new ScreenArea(bounds.X, bounds.Y, bounds.Width, bounds.Height), radius);
+            });
+        var pixels = OverlayBlurRegion.ToPixels(shown, device.M11, device.M22);
+        if (blurRegion is not null && blurRegion.SequenceEqual(pixels)) return;
+        WindowBlur.SetRegion(handle, pixels);
+        blurRegion = pixels;
+    }
+
     /// <summary>"Tıklamalar geçsin" açıksa (ve yeri ayarlanmıyorsa) fare pencereden geçer.</summary>
     private void ApplyClickThrough()
     {
         if (handle == IntPtr.Zero) return;
-        var through = controller.Settings.OverlayClickThrough && !controller.OverlayAdjusting;
         var style = (long)GetWindowLongPtr(handle, GwlExStyle);
-        var wanted = through ? style | WsExTransparent : style & ~WsExTransparent;
+        var wanted = OverlayWindowStyle.ClickThrough(style, controller.Settings.OverlayClickThrough, controller.OverlayAdjusting);
         if (wanted != style) SetWindowLongPtr(handle, GwlExStyle, (IntPtr)wanted);
     }
+
 
     /// <summary>Pencere en çok üç satıra (ve satırların kaymasına) yetecek kadar yüksektir; alt kenarı sabit kalır.</summary>
     private void FitHeight()
     {
-        var height = OverlayPlacement.Height(controller.Settings.Style.FontSize, Scale);
+        var height = OverlayPlacement.Height(Resolved.FontSize, Scale);
         if (Math.Abs(Height - height) < 0.5) return;
         var bottom = double.IsNaN(Top) ? double.NaN : Top + Height;
         Height = height;
@@ -411,7 +549,7 @@ public sealed partial class SubtitleOverlayWindow : Window
     /// </summary>
     private void PlaceFromSettings()
     {
-        var height = OverlayPlacement.Height(controller.Settings.Style.FontSize, Scale);
+        var height = OverlayPlacement.Height(Resolved.FontSize, Scale);
         var work = SystemParameters.WorkArea;
         var place = OverlayPlacement.Place(controller.Settings.Overlay,
             new ScreenArea(SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,

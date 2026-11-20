@@ -71,3 +71,54 @@ public static class OverlayPlacement
         return across >= Math.Min(VisiblePart, width) && down >= Math.Min(VisiblePart, height);
     }
 }
+
+/// <summary>
+/// Altyazı penceresinin Win32 genişletilmiş biçemleri (GWL_EXSTYLE). Pencere odağı almaz, Alt+Tab'da görünmez;
+/// "Tıklamalar geçsin" açıksa fare alttaki pencereye (oyun, PS Remote Play) gider.
+/// </summary>
+public static class OverlayWindowStyle
+{
+    public const long Transparent = 0x20;
+    public const long ToolWindow = 0x80;
+    public const long NoActivate = 0x08000000;
+
+    /// <summary>Pencere açılınca: odağı almaz ve Alt+Tab listesinde görünmez (diğer biçemler korunur).</summary>
+    public static long Base(long style) => style | NoActivate | ToolWindow;
+
+    /// <summary>Tıklamalar yalnız ayar açıksa ve pencerenin yeri ayarlanmıyorsa geçer (ayarlanırken sürüklenebilsin).</summary>
+    public static long ClickThrough(long style, bool clickThrough, bool adjusting) =>
+        clickThrough && !adjusting ? style | Transparent : style & ~Transparent;
+}
+
+/// <summary>Pencereye göre piksel cinsinden yuvarlak köşeli dikdörtgen (Win32 bölgesi için; köşe çapı piksel).</summary>
+public readonly record struct PixelBox(int Left, int Top, int Right, int Bottom, int CornerDiameter);
+
+/// <summary>
+/// Arka plan bulanıklığında pencere yalnız görünen kutuların şekline kırpılır (yoksa bütün pencere dikdörtgeni
+/// bulanıklaşırdı). Kutuların WPF birimiyle yerleri ekranın DPI ölçeğiyle piksele çevrilir.
+/// </summary>
+public static class OverlayBlurRegion
+{
+    /// <param name="boxes">Kutular: pencereye göre yer (WPF birimi) ve köşe yarıçapı.</param>
+    /// <param name="dpiX">Yatay ölçek (96 DPI'da 1, %150'de 1,5).</param>
+    public static IReadOnlyList<PixelBox> ToPixels(IEnumerable<(ScreenArea Area, double Radius)> boxes, double dpiX, double dpiY)
+    {
+        if (!double.IsFinite(dpiX) || dpiX <= 0) dpiX = 1;
+        if (!double.IsFinite(dpiY) || dpiY <= 0) dpiY = 1;
+        var result = new List<PixelBox>();
+        foreach (var (area, radius) in boxes)
+        {
+            if (!area.IsUsable) continue;
+            var left = (int)Math.Floor(area.Left * dpiX);
+            var top = (int)Math.Floor(area.Top * dpiY);
+            var right = (int)Math.Ceiling(area.Right * dpiX);
+            var bottom = (int)Math.Ceiling(area.Bottom * dpiY);
+            if (right <= left || bottom <= top) continue;
+            var diameter = double.IsFinite(radius) && radius > 0
+                ? (int)Math.Round(Math.Min(2 * radius * Math.Min(dpiX, dpiY), Math.Min(right - left, bottom - top)))
+                : 0;
+            result.Add(new PixelBox(left, top, right, bottom, diameter));
+        }
+        return result;
+    }
+}

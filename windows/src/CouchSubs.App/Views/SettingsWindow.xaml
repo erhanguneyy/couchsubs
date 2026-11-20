@@ -115,6 +115,8 @@
                             <Button Content="{t:T 'Send test subtitle'}" Click="OnTest" />
                         </StackPanel>
                     </c:Card>
+                    <!-- Yalnız bilgisayar ekranındaki altyazı penceresinin görünümü (TV, OBS etkilenmez). -->
+                    <local:DesktopStyleCard x:Name="DesktopStyle" Margin="0,12,0,0" />
                     <local:DubbingCard x:Name="Dubbing" Margin="0,12,0,0" />
                     <local:FirewallSettingsCard x:Name="FirewallSettings" Margin="0,12,0,0" />
                 </StackPanel>

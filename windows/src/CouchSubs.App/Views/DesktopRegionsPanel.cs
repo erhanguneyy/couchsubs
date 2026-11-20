@@ -27,6 +27,10 @@ internal sealed class DesktopRegionsPanel : DockPanel
         Children.Add(phone);
     }
 
+    /// <summary>Görünen ek alan kutuları (arka plan bulanıklığında pencere bunların şekline de kırpılır).</summary>
+    public IEnumerable<FrameworkElement> Boxes =>
+        hud.Children.OfType<FrameworkElement>().Concat(phone.Child is not null ? [phone] : Array.Empty<FrameworkElement>());
+
     public void ShowRegions(Dictionary<string, (string Text, RegionBox? Box, IReadOnlyList<CouchSubs.Core.ScreenTranslation.Item>? Blocks)> regions,
                             Func<string, RegionBox?, IReadOnlyList<CouchSubs.Core.ScreenTranslation.Item>?, Border> makeBox)
     {

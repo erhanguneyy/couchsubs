@@ -9,6 +9,7 @@
     <Project Path="src/CouchSubs.TvInstall/CouchSubs.TvInstall.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/CouchSubs.App.Tests/CouchSubs.App.Tests.csproj" />
     <Project Path="tests/CouchSubs.Core.Tests/CouchSubs.Core.Tests.csproj" />
     <Project Path="tests/CouchSubs.RemotePlay.Tests/CouchSubs.RemotePlay.Tests.csproj" />
     <Project Path="tests/CouchSubs.Shell.Tests/CouchSubs.Shell.Tests.csproj" />

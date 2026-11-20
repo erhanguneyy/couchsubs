@@ -251,6 +251,15 @@ public sealed record UserSettings
     public ResultTarget FreeAreaTarget { get; init; } = ResultTarget.Tv;
     public SubtitleStyle Style { get; init; } = new();
     /// <summary>
+    /// Yalnız bilgisayar ekranındaki altyazı penceresinin görünümü (yazı tipi, kontur, gölge, zemin…). Eski ayar
+    /// dosyalarında yoktur; pencere TV görünümünü izler (<see cref="DesktopStylePreset.MatchTv"/>), eskisi gibi görünür.
+    /// Çizilecek değerler: <see cref="DesktopStyles.Resolve"/>.
+    /// </summary>
+    public DesktopSubtitleStyle DesktopStyle { get; init; } = new();
+    /// <summary>Kullanıcının adla kaydettiği pencere görünümleri (bkz. <see cref="DesktopStyleLibrary"/>). Eski ayarlarda boş.</summary>
+    [System.Text.Json.Serialization.JsonConverter(typeof(SavedDesktopStylesConverter))]
+    public IReadOnlyList<SavedDesktopStyle> SavedDesktopStyles { get; init; } = [];
+    /// <summary>
     /// Gelişmiş: bozuk okunan satırın daha iyi okuma için en çok bekletileceği süre (ms; 0: beklenmez). Eski kayıtlar
     /// varsayılanla açılır.
     /// </summary>

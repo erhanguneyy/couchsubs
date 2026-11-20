@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+  <!--
+    Bilgisayar ekranındaki altyazı kutusunun çizimi (WPF), STA iş parçacığında, pencere açmadan sınanır. Uygulama
+    projesine başvurulmaz (Xbox bileşeni ve yerel kitaplıklar olmadan da derlensin, PR testleri gibi); sınanan dosyalar
+    bağlantıyla derlenir.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\src\CouchSubs.App\Views\DesktopSubtitleBox.cs" Link="Linked\DesktopSubtitleBox.cs" />
+    <Compile Include="..\..\src\CouchSubs.App\Views\InstalledFonts.cs" Link="Linked\InstalledFonts.cs" />
+    <Compile Include="..\..\src\CouchSubs.App\Views\SpeakerText.cs" Link="Linked\SpeakerText.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CouchSubs.Shell\CouchSubs.Shell.csproj" />
+  </ItemGroup>
+
+</Project>
